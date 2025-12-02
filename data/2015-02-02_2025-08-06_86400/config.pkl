@@ -1,0 +1,16 @@
+additional_features: []
+data_path: ./data/hdfcbank_daily_2015_2025.csv
+date_format: '%Y-%m-%d'
+end_date: '2025-08-06'
+jumps: 86400
+root: ./data
+start_date: '2015-02-02'
+test_interval:
+- '2025-01-01'
+- '2025-08-07'
+train_interval:
+- '2020-01-01'
+- '2024-01-01'
+val_interval:
+- '2024-01-01'
+- '2025-01-01'

@@ -62,6 +62,12 @@ class BaseModule(pl.LightningModule):
         return y, y_hat
 
     def training_step(self, batch, batch_idx):
+        # If child class implements _get_loss, defer to it (e.g. CryptoMambaModule)
+        if hasattr(self, '_get_loss'):
+            loss = self._get_loss(batch)
+            self.log('train_loss', loss, batch_size=self.batch_size, sync_dist=True, prog_bar=True)
+            return loss
+            
         x = batch['features']
         y = batch[self.y_key]
         y_old = batch[f'{self.y_key}_old']
@@ -90,6 +96,12 @@ class BaseModule(pl.LightningModule):
         
     
     def validation_step(self, batch, batch_idx):
+        # If child class implements _get_loss, defer to it (e.g. CryptoMambaModule)
+        if hasattr(self, '_get_loss'):
+            loss = self._get_loss(batch)
+            self.log('val_loss', loss, batch_size=self.batch_size, sync_dist=True, prog_bar=True)
+            return {"val_loss": loss}
+
         x = batch['features']
         y = batch[self.y_key]
         y_old = batch[f'{self.y_key}_old']
@@ -111,6 +123,12 @@ class BaseModule(pl.LightningModule):
         }
     
     def test_step(self, batch, batch_idx):
+        # If child class implements _get_loss, defer to it (e.g. CryptoMambaModule)
+        if hasattr(self, '_get_loss'):
+            loss = self._get_loss(batch)
+            self.log('test_loss', loss, batch_size=self.batch_size, sync_dist=True, prog_bar=True)
+            return {"test_loss": loss}
+
         x = batch['features']
         y = batch[self.y_key]
         y_old = batch[f'{self.y_key}_old']
@@ -134,6 +152,10 @@ class BaseModule(pl.LightningModule):
     def configure_optimizers(self):
         if self.optimizer == 'adam':
             optim = torch.optim.Adam(
+                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+            )
+        elif self.optimizer == 'adamw':
+            optim = torch.optim.AdamW(
                 self.parameters(), lr=self.lr, weight_decay=self.weight_decay
             )
         elif self.optimizer == 'sgd':

@@ -1,0 +1,23 @@
+accelerator: gpu
+additional_features: []
+batch_size: 32
+config: classification_v1
+data_config: classification_daily
+devices: 1
+expname: MambaClassify_v1
+hyperparams:
+  lr: 0.001
+  lr_gamma: 0.5
+  lr_step_size: 100
+  optimizer: adamw
+  weight_decay: 0.01
+logdir: null
+logger_type: tb
+max_epochs: 1000
+model: CMamba_class_v1
+name: MambaClassify
+num_workers: 4
+resume_from_checkpoint: null
+save_checkpoints: true
+seed: 23
+use_volume: true

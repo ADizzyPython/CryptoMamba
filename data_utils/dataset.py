@@ -31,8 +31,20 @@ class CMambaDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i: int):
         sample = self.data.iloc[i: i + self.window_size + 1]
-        sample = self.transform(sample)
-        return sample
+        
+        # Extract target class if it exists (for the last element in sequence)
+        target_class = None
+        if 'Bin_Class' in sample.columns:
+            # The target is the NEXT day's return class relative to the window
+            # The window is size `window_size`, so the last element is the target
+            target_class = int(sample.iloc[-1]['Bin_Class'])
+        
+        processed = self.transform(sample)
+        
+        if target_class is not None:
+            processed['target_class'] = torch.tensor(target_class, dtype=torch.long)
+            
+        return processed
     
 class DataConverter:
     def __init__(self, config) -> None:
@@ -44,7 +56,13 @@ class DataConverter:
         self.end_date = config.get('end_date')
         self.data_path = config.get('data_path')
         self.start_date = config.get('start_date')
-        self.folder_name = f'{self.start_date}_{self.end_date}_{self.jumps}'
+        self.use_returns = config.get('use_returns', False)
+        self.binning_config = config.get('binning', None)
+        
+        if self.use_returns:
+             self.folder_name = f'{self.start_date}_{self.end_date}_{self.jumps}_returns'
+        else:
+            self.folder_name = f'{self.start_date}_{self.end_date}_{self.jumps}'
         self.file_path = f'{self.root}/{self.folder_name}'
 
     
@@ -55,6 +73,8 @@ class DataConverter:
             new_df[key] = []
         for key in self.additional_features:
             new_df[key] = []
+        
+        # Process basic candles
         for i in tqdm(range(start, stop - self.jumps // 60 + 1, self.jumps)):
             high, low, open, close, vol = self.merge_data(data, i, self.jumps)
             additional_features = self.merge_additional(data, i, self.jumps)
@@ -71,7 +91,40 @@ class DataConverter:
 
         df = pd.DataFrame(new_df)
 
+        # Calculate Returns and Bins if enabled
+        if self.use_returns:
+            # Calculate percentage returns: (Current - Prev) / Prev * 100
+            # We shift by 1 to get previous close
+            df['Prev_Close'] = df['Close'].shift(1)
+            df['Returns'] = ((df['Close'] - df['Prev_Close']) / df['Prev_Close']) * 100
+            
+            # Drop the first row which has NaN return
+            df = df.dropna().reset_index(drop=True)
+            
+            if self.binning_config:
+                df['Bin_Class'] = df['Returns'].apply(self.map_return_to_bin)
+
         return df
+
+    def map_return_to_bin(self, ret):
+        min_r = self.binning_config.get('min_range', -3.5)
+        max_r = self.binning_config.get('max_range', 3.5)
+        step = self.binning_config.get('step', 0.25)
+        
+        # Clamp returns to range
+        if ret < min_r:
+            return 0
+        if ret > max_r:
+            # Calculate max index
+            num_bins = int((max_r - min_r) / step)
+            return num_bins + 1
+        
+        # Calculate bin index
+        # Bin 0 is < min_r
+        # Bin 1 is [min_r, min_r + step)
+        # etc.
+        bin_idx = int((ret - min_r) / step) + 1
+        return bin_idx
 
     def get_data(self):
         tmp = '----'

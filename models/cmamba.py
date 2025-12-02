@@ -396,7 +396,7 @@ class CMamba(nn.Module):
 
         self.post_process = nn.Sequential(
             Permute(0, 2, 1),
-            nn.Linear(num_features, 1),
+            nn.Linear(num_features, 1 if num_classes is None else num_classes),
         )
         self.tanh = nn.Tanh()
 

@@ -57,3 +57,22 @@ class CryptoMambaModule(BaseModule):
             use_checkpoint=use_checkpoint,
             **kwargs
         )
+
+    def _get_loss(self, batch):
+        if self.loss == 'cross_entropy':
+            target = batch.get('target_class').to(self.device)
+            features = batch.get('features').to(self.device)
+            preds = self.model(features)
+            # preds shape: (B, num_classes)
+            # target shape: (B)
+            loss = nn.CrossEntropyLoss()(preds, target)
+        else:
+            target = batch.get(self.y_key).to(self.device)
+            features = batch.get('features').to(self.device)
+            preds = self.model(features)
+            loss = nn.MSELoss()(preds, target.unsqueeze(1))
+            if self.loss == 'rmse':
+                loss = torch.sqrt(loss)
+            elif self.loss == 'mae':
+                loss = nn.L1Loss()(preds, target.unsqueeze(1))
+        return loss

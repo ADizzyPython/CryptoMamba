@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(pathlib.Path(__file__).parent.absolute()))
 
 import torch
 import numpy as np
+import pandas as pd
 import seaborn as sns
 from utils import io_tools
 from utils.trade import trade
@@ -110,7 +111,7 @@ def get_args():
         "--trade_mode",
         type=str,
         default='smart',
-        choices={'smart', 'smart_w_short', 'vanilla', 'no_strategy'},
+        choices={'smart', 'smart_w_short', 'vanilla', 'no_strategy', 'smart_prob'},
     )
 
     args = parser.parse_args()
@@ -147,24 +148,50 @@ def max_drawdown(prices):
 
 
 @torch.no_grad()
-def run_model(model, dataloader, factors=None):
+def run_model(model, dataloader, factors=None, is_classification=False):
     target_list = []
     preds_list = []
     timetamps = []
+    probs_list = [] # To store full probability distributions
+    
     with torch.no_grad():
         for batch in dataloader:
             ts = batch.get('Timestamp').numpy().reshape(-1)
-            target = batch.get(model.y_key).numpy().reshape(-1)
             features = batch.get('features').to(model.device)
-            preds = model(features).cpu().numpy().reshape(-1)
+            
+            # Run model
+            output = model(features)
+            
+            # Handle Classification vs Regression
+            if is_classification:
+                # output shape: (B, num_classes)
+                # Apply Softmax to get probabilities
+                probs = torch.softmax(output, dim=1).cpu().numpy()
+                
+                # For single prediction, we can take argmax (class) or expected value
+                # Let's store the class prediction
+                preds = np.argmax(probs, axis=1)
+                
+                # Get targets (class indices)
+                target = batch.get('target_class').numpy().reshape(-1)
+                
+                preds_list += [int(x) for x in list(preds)]
+                probs_list += [x for x in list(probs)]
+                
+            else:
+                # Regression output
+                preds = output.cpu().numpy().reshape(-1)
+                target = batch.get(model.y_key).numpy().reshape(-1)
+                preds_list += [float(x) for x in list(preds)]
+            
             target_list += [float(x) for x in list(target)]
-            preds_list += [float(x) for x in list(preds)]
+            
             if factors is not None:
                 timetamps += [float(x) for x in list(batch.get('Timestamp_orig').numpy().reshape(-1))]
             else:
                 timetamps += [float(x) for x in list(ts)]
 
-    if factors is not None:
+    if not is_classification and factors is not None:
         scale = factors.get(model.y_key).get('max') - factors.get(model.y_key).get('min')
         shift = factors.get(model.y_key).get('min')
         target_list = [x * scale + shift for x in target_list]
@@ -172,8 +199,9 @@ def run_model(model, dataloader, factors=None):
 
     targets = np.asarray(target_list)
     preds = np.asarray(preds_list)
+    probs = np.asarray(probs_list) if is_classification else None
 
-    return timetamps, targets, preds
+    return timetamps, targets, preds, probs
 
 
 if __name__ == '__main__':
@@ -198,7 +226,11 @@ if __name__ == '__main__':
             init_dirs(args, config.get('name', args.expname))
         data_config = io_tools.load_config_from_yaml(f"{ROOT}/configs/data_configs/{config.get('data_config')}.yaml")
         
-        model, normalize = load_model(config, args.ckpt_path, config_name=conf) 
+        model, normalize = load_model(config, args.ckpt_path, config_name=conf)
+        
+        # Check if model is classification based on config
+        num_classes = config.get('params', {}).get('num_classes', None)
+        is_classification = num_classes is not None
 
         use_volume = config.get('use_volume', False)
         test_transform = DataTransform(is_train=False, use_volume=use_volume, additional_features=config.get('additional_features', []))
@@ -210,6 +242,7 @@ if __name__ == '__main__':
                                         distributed_sampler=False,
                                         num_workers=args.num_workers,
                                         normalize=normalize,
+                                        window_size=config.get('params', {}).get('window_size', 14)
                                         )
         
         if args.split == 'test':
@@ -222,20 +255,84 @@ if __name__ == '__main__':
         factors = None
         if normalize:
             factors = data_module.factors
-        timstamps, targets, preds = run_model(model, test_loader, factors)
+            
+        timstamps, targets, preds, probs = run_model(model, test_loader, factors, is_classification)
+        
+        # Process predictions for trading
+        trading_preds = preds
+        
+        # For classification, calculate expected return
+        expected_returns = None
+        if is_classification:
+            # Bin definitions (should match config/dataset)
+            min_r = data_config.get('binning', {}).get('min_range', -3.5)
+            max_r = data_config.get('binning', {}).get('max_range', 3.5)
+            step = data_config.get('binning', {}).get('step', 0.25)
+            
+            # Create bin centers
+            # Bin 0: < min_r (we'll assume min_r - step)
+            # Bin N: > max_r (we'll assume max_r + step)
+            # Middle bins: min_r + step/2, etc.
+            num_bins = int((max_r - min_r) / step) + 2 # +2 for underflow/overflow
+            
+            bin_values = []
+            # Underflow bin
+            bin_values.append(min_r - step)
+            # Middle bins
+            current = min_r
+            while current < max_r:
+                bin_values.append(current + step/2)
+                current += step
+            # Overflow bin
+            bin_values.append(max_r + step)
+            
+            bin_values = np.array(bin_values)
+            
+            # Calculate expected return: sum(prob * bin_value)
+            expected_returns = np.sum(probs * bin_values, axis=1)
+            trading_preds = expected_returns
 
-        data = test_loader.dataset.data
+        # Concatenate all data splits to ensure historical data availability for trading simulation
+        full_data = pd.concat(data_module.data_dict.values())
+        # Remove duplicates just in case, though splits should be distinct
+        full_data = full_data.drop_duplicates(subset=['Timestamp']).sort_values(by=['Timestamp']).reset_index(drop=True)
+        
+        data = full_data
         tmp = data.get('Close')
         time_key = 'Timestamp'
         if normalize:
             time_key = 'Timestamp_orig'
+            # Only de-normalize data if we are in regression mode where preds are prices
+            # In classification mode, preds are classes/returns, but we still need prices for trading simulation
             scale = factors.get(model.y_key).get('max') - factors.get(model.y_key).get('min')
             shift = factors.get(model.y_key).get('min')
             data[model.y_key] = data[model.y_key] * scale + shift
 
-        balance, balance_in_time = trade(data, time_key, timstamps, targets, preds, 
+        balance, balance_in_time = trade(data, time_key, timstamps, targets, trading_preds, 
                                          balance=args.balance, mode=args.trade_mode, 
-                                         risk=args.risk, y_key=model.y_key)
+                                         risk=args.risk, y_key=model.y_key, is_classification=is_classification)
+        
+        # Save predictions to CSV
+        output_data = {
+            'Timestamp': timstamps,
+            'Date': [datetime.fromtimestamp(int(x)) for x in timstamps],
+            'Actual': targets, # Class index or price
+        }
+        
+        if is_classification:
+            output_data['Predicted_Class'] = preds
+            output_data['Expected_Return'] = expected_returns
+            # Optionally add max prob
+            output_data['Max_Prob'] = np.max(probs, axis=1)
+        else:
+            output_data['Predicted_Price'] = preds
+            
+        output_df = pd.DataFrame(output_data)
+        
+        # Create filename based on config and split
+        csv_filename = f"{ROOT}/Results/{config.get('name', args.expname)}/{conf}_predictions_{args.split}.csv"
+        output_df.to_csv(csv_filename, index=False)
+        print(f"Predictions saved to: {csv_filename}")
 
         print(f'{conf} -- Final balance: {round(balance, 2)}')
         print(f'{conf} -- Maximum Draw Down : {round(max_drawdown(balance_in_time) * 100, 2)}')
